@@ -50,8 +50,8 @@ typedef struct {
 #define MAX_RMS               128    // Cantidad muestras RMS por canal
 #define MAX_RMS_PROM          3   // Cantidad de valores RMS promediados 10 = 50 segundos
 #define HYST                  40    // Histéresis para cruce (cuentas ADC)
-#define I_MAX                 1638  // 80% = 0.8 * 4095 / 2
-#define I_MIN                 512 // 25% = 0.25 * 4095 / 2 
+#define I_MAX                 1945  // 95% = 0.95 * 4095 / 2
+#define I_MIN                 102 // 5% = 0.05 * 4095 / 2 
 #define TOTAL_GAIN_CURRENT    7U
 /*
 #define V1_GAIN               (222.0f / (0.6505f * 4095.f))
@@ -622,13 +622,14 @@ void AdjustCurrentGain_Wiper(void){
 
       if(wiper[phase] < 0){
         wiper[phase] = 0;
+        cambio_wiper[phase] = 0;
       }
     }else if(i_max[phase] < I_MIN && i_min[phase] > -I_MIN){
       cambio_wiper[phase] = 1;
       wiper[phase]++;
 
-      if(wiper[phase] > 6){
-        wiper[phase] = 6;
+      if(wiper[phase] > TOTAL_GAIN_CURRENT - 1){
+        wiper[phase] = TOTAL_GAIN_CURRENT - 1;
         cambio_wiper[phase] = 0;
       }
     }
