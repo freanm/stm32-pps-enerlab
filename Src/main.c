@@ -50,9 +50,11 @@ typedef struct {
 #define MAX_RMS               128    // Cantidad muestras RMS por canal
 #define MAX_RMS_PROM          3   // Cantidad de valores RMS promediados 10 = 50 segundos
 #define HYST                  40    // Histéresis para cruce (cuentas ADC)
-#define I_MAX                 1945  // 95% = 0.95 * 4095 / 2
-#define I_MIN                 102 // 5% = 0.05 * 4095 / 2 
+#define I_MAX                 1843  // 90% = 0.9 * 4095 / 2
+#define I_MIN                 512 // 10% = 0.1 * 4095 / 2 
 #define TOTAL_GAIN_CURRENT    7U
+#define TIMEOUT_MAX           500U
+#define PER_NO_SIGNAL         5U    // cantidad de periodos sin señal para resetear wiper a ganancia mínima
 /*
 #define V1_GAIN               (222.0f / (0.6505f * 4095.f))
 #define V2_GAIN               (222.0f / (0.6505f * 4095.f))
@@ -61,12 +63,12 @@ typedef struct {
 #define I2_GAIN               (10.46f / (0.164f * 4095.f))
 #define I3_GAIN               (10.51f / (0.168f * 4095.f))
 */
-const double V1_GAIN = 0.08022185119191212188;
-const double V2_GAIN = 0.08054880910857070697;
-const double V3_GAIN = 0.07951654144835709759;
-const double I1_GAIN = 0.01457762941325099933;
-const double I2_GAIN = 0.01482773367120644378;
-const double I3_GAIN = 0.01485965187518037064;
+const float V1_GAIN = 0.08022185119191212188f;
+const float V2_GAIN = 0.08054880910857070697f;
+const float V3_GAIN = 0.07951654144835709759f;
+const float I1_GAIN = 0.01457762941325099933f;
+const float I2_GAIN = 0.01482773367120644378f;
+const float I3_GAIN = 0.01485965187518037064f;
 
 /* USER CODE END PD */
 
@@ -108,12 +110,15 @@ static uint8_t cruce_ascendente = 0;
 static int16_t sample_buffer[TOTAL_CHANNELS][MAX_SAMPLES];  //se almacenan muestras de un periodo
 static float rms_buffer[TOTAL_CHANNELS][MAX_RMS];           //se almacenan valores RMS de un periodo
 static float P_buffer[TOTAL_PHASES][MAX_RMS];               //se almacenan valores de potencia activa por periodo
+static float Q_buffer[TOTAL_PHASES][MAX_RMS];               //se almacenan valores de potencia reactiva por periodo
 
 static float rms_prom_buffer[TOTAL_CHANNELS][MAX_RMS_PROM];      //se almacenan valores RMS promediados
 static float P_prom_buffer[TOTAL_PHASES][MAX_RMS_PROM];          //se almacenan valores de potencia activa promediados
+static float Q_prom_buffer[TOTAL_PHASES][MAX_RMS_PROM];          //se almacenan valores de potencia reactiva promediados
 
 static float rms_total[TOTAL_CHANNELS];
 static float P_total[TOTAL_PHASES];
+static float Q_total[TOTAL_PHASES];
 static float S[TOTAL_PHASES];
 static float FP[TOTAL_PHASES];
 
@@ -130,6 +135,8 @@ const uint8_t wiper_position[TOTAL_GAIN_CURRENT] = {64, 85, 102, 113, 120, 124, 
 const uint8_t wiper_position_reverse[TOTAL_GAIN_CURRENT] = {64, 43, 26, 15, 8, 4, 2};
 static float gain_table[TOTAL_PHASES] = {1, 1, 1};
 
+static uint8_t count_noSignal[TOTAL_PHASES] = {0, 0, 0}; // contador de periodos sin señal para cada fase
+
 
 static const uint8_t valid_channels[TOTAL_CHANNELS] = {0,1,2,6,4,5};
 
@@ -141,7 +148,7 @@ static int16_t rms_prom_index = -1;
 static uint16_t timeout = 0;
 static uint16_t timer_cont = 0;
 
-static double vdda = 3.3;
+static float vdda = 3.3f;
 static int16_t v1 = 0; // Tension fase 1 -> referencia para cruce por cero
 
 
@@ -150,14 +157,15 @@ static int16_t v1 = 0; // Tension fase 1 -> referencia para cruce por cero
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static double calculate_rms(int16_t *buffer, uint8_t samples);
-static double adc_to_voltage(double adc_value, uint8_t phase);
-static double adc_to_current(double adc_value, double gain, uint8_t phase);
+static float calculate_rms(int16_t *buffer, uint8_t samples);
+static float adc_to_voltage(float adc_value, uint8_t phase);
+static float adc_to_current(float adc_value, float gain, uint8_t phase);
 void AdjustCurrentGain_Wiper(void);
 //uint8_t reverse_vector(const uint8_t *vector, uint8_t index);
 float calculate_gain(uint8_t wiper_position, uint8_t invertido);
 
 static float calculate_active_power(int16_t *buffer_tension, int16_t *buffer_corriente, uint8_t samples);
+static void calculate_single_bin_dft(int16_t *buffer, uint8_t samples, float *real, float *imag);
 static float calculate_mean(float *buffer, uint8_t samples);
 
 void vdda_calibrated(void);
@@ -239,11 +247,11 @@ int main(void)
   while (1)
   {
     /* Timeout de cruce por cero para evitar quedarse esperando si la TENSION se pierde o es nula
-    muestreo a 5kHz (ts = 0,02ms) 
-    eligiendo un timeout de T = 25ms 
-    numero de muestras: n = T/ts = 125
+    muestreo a 5kHz (ts = 0,2ms) 
+    eligiendo un timeout de T (TIMEOUT_MAX)
+    numero de muestras: n = T/ts
     */
-    if(timer_cont > 125){
+    if(timer_cont > TIMEOUT_MAX){
       timeout = 1;
       flag_adc_ready = 1; // fuerza a esperar nueva muestra de ADC para iniciar nuevo periodo
       adc_calibrated = 1;
@@ -319,19 +327,35 @@ int main(void)
           AdjustCurrentGain_Wiper();
 
           // Si no se cambia wiper de la fase ph
-          // Calcula Vrms, Irms, Pot activa, Pot aparente y cos(phi)
+          // Calcula Vrms, Irms, Pot activa, Pot aparente y Pot reactiva
+          // periodo a periodo
           for(uint8_t ph = 0; ph < TOTAL_PHASES; ph++) {
             if(!cambio_wiper[ph]){
-              rms_buffer[ph][rms_index - count_cambio_wiper[ph]] = calculate_rms(sample_buffer[ph],sample_index);
-              rms_buffer[ph + TOTAL_PHASES][rms_index - count_cambio_wiper[ph]] = calculate_rms(sample_buffer[ph + TOTAL_PHASES],sample_index);
+              int idx = (int)rms_index - (int)count_cambio_wiper[ph];
+              if (idx < 0) idx += MAX_RMS; // wrap-around seguro
 
-              rms_real[ph] = adc_to_voltage(rms_buffer[ph][rms_index - count_cambio_wiper[ph]], ph);
-              rms_real[ph+TOTAL_PHASES] = adc_to_current(rms_buffer[ph + TOTAL_PHASES][rms_index - count_cambio_wiper[ph]],gain_table[ph], ph);
+              rms_buffer[ph][idx] = calculate_rms(sample_buffer[ph], sample_index);
+              rms_buffer[ph + TOTAL_PHASES][idx] = calculate_rms(sample_buffer[ph + TOTAL_PHASES], sample_index);
 
-              rms_buffer[ph + TOTAL_PHASES][rms_index - count_cambio_wiper[ph]] = adc_to_current(rms_buffer[ph + TOTAL_PHASES][rms_index - count_cambio_wiper[ph]],gain_table[ph], ph);
-              P_buffer[ph][rms_index - count_cambio_wiper[ph]] = calculate_active_power(sample_buffer[ph], sample_buffer[ph+TOTAL_PHASES], sample_index);
-              P_buffer[ph][rms_index - count_cambio_wiper[ph]] = adc_to_voltage(P_buffer[ph][rms_index - count_cambio_wiper[ph]], ph);
-              P_buffer[ph][rms_index - count_cambio_wiper[ph]] = adc_to_current(P_buffer[ph][rms_index - count_cambio_wiper[ph]], gain_table[ph], ph);
+              rms_real[ph] = adc_to_voltage(rms_buffer[ph][idx], ph);
+              rms_real[ph + TOTAL_PHASES] = adc_to_current(rms_buffer[ph + TOTAL_PHASES][idx], gain_table[ph], ph);
+
+              rms_buffer[ph + TOTAL_PHASES][idx] = adc_to_current(rms_buffer[ph + TOTAL_PHASES][idx], gain_table[ph], ph);
+              
+              float v_re, v_im, i_re, i_im;
+              calculate_single_bin_dft(sample_buffer[ph], sample_index, &v_re, &v_im);
+              calculate_single_bin_dft(sample_buffer[ph + TOTAL_PHASES], sample_index, &i_re, &i_im);
+              
+              float P_fund = 0.5f * (v_re * i_re + v_im * i_im);
+              float Q_fund = 0.5f * (v_im * i_re - v_re * i_im);
+              
+              P_buffer[ph][idx] = -P_fund;
+              P_buffer[ph][idx] = adc_to_voltage(P_buffer[ph][idx], ph);
+              P_buffer[ph][idx] = adc_to_current(P_buffer[ph][idx], gain_table[ph], ph);
+
+              Q_buffer[ph][idx] = -Q_fund;
+              Q_buffer[ph][idx] = adc_to_voltage(Q_buffer[ph][idx], ph);
+              Q_buffer[ph][idx] = adc_to_current(Q_buffer[ph][idx], gain_table[ph], ph);
             }        
           }
 
@@ -345,6 +369,7 @@ int main(void)
               //rms_real[ph] = adc_to_voltage(rms_prom_buffer[ph][rms_prom_index]);
 
               P_prom_buffer[ph][rms_prom_index] = calculate_mean(P_buffer[ph], 1 + rms_index - count_cambio_wiper[ph]);
+              Q_prom_buffer[ph][rms_prom_index] = calculate_mean(Q_buffer[ph], 1 + rms_index - count_cambio_wiper[ph]);
             }
           }
 
@@ -357,11 +382,12 @@ int main(void)
               rms_total[ph] = adc_to_voltage(rms_total[ph], ph);
               
               P_total[ph] = calculate_mean(P_prom_buffer[ph], MAX_RMS_PROM);
+              Q_total[ph] = calculate_mean(Q_prom_buffer[ph], MAX_RMS_PROM);
 
               S[ph] = rms_total[ph] * rms_total[ph + TOTAL_PHASES];
 
-              FP[ph] = P_total[ph] / S[ph];
-              FP[ph] = acosf(FP[ph]) * (180.0f / M_PI); // Angulo PHI en grados
+              //FP[ph] = P_total[ph] / S[ph];
+              FP[ph] = atanf(Q_total[ph] / P_total[ph]) * (180.0f / 3.1415926535f);// Angulo PHI en grados
             }
             calculos_ready = 1; // listo para enviar por UART
             adc_calibrated = 0; // 0 para volver a calibrar Vdda
@@ -412,11 +438,12 @@ int main(void)
       int len = snprintf(
         rms_tx_buf,
         sizeof(rms_tx_buf),
-        "{\"version\":\"%s\",\"rms\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],\"p\":[%.3f,%.3f,%.3f],\"fp\":[%.3f,%.3f,%.3f]}\r\n",
+        "{\"version\":\"%s\",\"rms\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],\"p\":[%.3f,%.3f,%.3f],\"q\":[%.3f,%.3f,%.3f],\"fp\":[%.3f,%.3f,%.3f]}\r\n",
         FIRMWARE_VERSION,
         rms_total[0], rms_total[1], rms_total[2],
         rms_total[3], rms_total[4], rms_total[5],
         P_total[0], P_total[1], P_total[2],
+        Q_total[0], Q_total[1], Q_total[2],
         FP[0], FP[1], FP[2]
       );
 
@@ -552,14 +579,14 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
 }
 
 
-static double calculate_rms(int16_t *buffer, uint8_t samples) {
-  if (samples == 0) return 0.0;
+static float calculate_rms(int16_t *buffer, uint8_t samples) {
+  if (samples == 0) return 0.0f;
 
-  double sum = 0.0;
+  float sum = 0.0f;
   for (uint16_t i = 0; i < samples; i++) {
-      sum += (double)buffer[i] * (double)buffer[i];
+      sum += (float)buffer[i] * (float)buffer[i];
   }
-  return sqrt(sum / (double)samples);
+  return (sqrtf(sum / (float)samples));
 }
 
 void vdda_calibrated(void) {
@@ -571,12 +598,12 @@ void vdda_calibrated(void) {
 
   uint16_t adc_vrefint = adcData.channels[3];
 
-  vdda = (1.21 * 4095.0) / (double)adc_vrefint;
+  vdda = (1.21f * 4095.0f) / (float)adc_vrefint;
 
   adc_calibrated = 1;
 }
 
-static double adc_to_voltage(double adc_value, uint8_t phase)
+static float adc_to_voltage(float adc_value, uint8_t phase)
 {
   // ECUACION: V = adc_value * (vdda/4095) * (Vi/Vo)
 
@@ -595,7 +622,7 @@ static double adc_to_voltage(double adc_value, uint8_t phase)
   //return ((float)adc_value * vdda * 0.08153905715f);//adc_value*(197.7/0.5842)*(vdda/4095)
 }
 
-static double adc_to_current(double adc_value, double gain, uint8_t phase)
+static float adc_to_current(float adc_value, float gain, uint8_t phase)
 {
   switch(phase){
     case 0:
@@ -631,17 +658,18 @@ void AdjustCurrentGain_Wiper(void){
       if(wiper[phase] > TOTAL_GAIN_CURRENT - 1){
         wiper[phase] = TOTAL_GAIN_CURRENT - 1;
         cambio_wiper[phase] = 0;
+        count_noSignal[phase]++; // contador de periodos sin señal
+        if(count_noSignal[phase] > PER_NO_SIGNAL){ // si no hay señal por más de PER_NO_SIGNAL periodos, resetea al wiper para NO amplificar ruido
+          wiper[phase] = 0; //ganancia OPAMP x1
+          count_noSignal[phase] = 0;
+        }
       }
     }
     
-    if(rms_index == 0){
-      cambio_wiper[phase] = 1;
-      count_cambio_wiper[phase]++;
-    }
-
-    // Comunicacion con Pote Digital 
+    // Comunicacion con Pote Digital
     if(cambio_wiper[phase]){
-      count_cambio_wiper[phase]++;
+      // establecer contador de muestras a ignorar tras cambio de wiper
+      count_cambio_wiper[phase] = 1;
       
       switch(phase){
         case 1:
@@ -695,6 +723,24 @@ static float calculate_mean(float *buffer, uint8_t samples)
   }
 
   return acc / (float)samples;
+}
+
+static void calculate_single_bin_dft(int16_t *buffer, uint8_t samples, float *real, float *imag) {
+  if (samples == 0) {
+    *real = 0.0f;
+    *imag = 0.0f;
+    return;
+  }
+  float sum_re = 0.0f;
+  float sum_im = 0.0f;
+  float omega = 2.0f * 3.1415926535f / (float)samples;
+  for (uint16_t n = 0; n < samples; n++) {
+    float angle = omega * (float)n;
+    sum_re += (float)buffer[n] * cosf(angle);
+    sum_im += (float)buffer[n] * sinf(angle);
+  }
+  *real = 2.0f * sum_re / (float)samples;
+  *imag = -2.0f * sum_im / (float)samples;
 }
 
 /* USER CODE END 4 */
